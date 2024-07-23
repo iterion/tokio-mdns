@@ -4,12 +4,11 @@ pub mod net_utils;
 
 pub use dns_parser::QueryType;
 use dns_parser::{Builder, Packet, QueryClass, RData, ResourceRecord};
-use smol::channel::{bounded, Receiver};
-use smol::net::UdpSocket;
-use smol::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use thiserror::*;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc::{channel, Receiver};
 
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MULTICAST_PORT: u16 = 5353;
@@ -20,9 +19,9 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    ChanRecv(#[from] smol::channel::RecvError),
+    ChanRecv(#[from] tokio::sync::mpsc::error::TryRecvError),
     #[error(transparent)]
-    ChanSend(#[from] smol::channel::SendError<Response>),
+    ChanSend(#[from] tokio::sync::mpsc::error::SendError<Response>),
     #[error("failed to build DNS packet")]
     DnsPacketBuildError,
     #[error("Timed out")]
@@ -52,7 +51,7 @@ async fn create_socket() -> Result<UdpSocket> {
     let addr = sockaddr(Ipv4Addr::UNSPECIFIED, MULTICAST_PORT);
     socket.bind(&addr.into())?;
 
-    let socket = UdpSocket::from(smol::Async::new(socket.into())?);
+    let socket = UdpSocket::from_std(socket.into())?;
     socket.set_multicast_loop_v4(false)?;
     socket.join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED)?;
     Ok(socket)
@@ -308,8 +307,8 @@ pub async fn resolve_one<S: AsRef<str>>(
     service_name: S,
     params: QueryParameters,
 ) -> Result<Response> {
-    let responses = resolve(service_name, params).await?;
-    let response = responses.recv().await?;
+    let mut responses = resolve(service_name, params).await?;
+    let response = responses.recv().await.ok_or(Error::Timeout)?;
     Ok(response)
 }
 
@@ -455,9 +454,9 @@ pub async fn resolve<S: AsRef<str>>(
 
     socket.send_to(&data, addr).await?;
 
-    let (tx, rx) = bounded(8);
+    let (tx, rx) = channel(8);
 
-    smol::spawn(async move {
+    tokio::spawn(async move {
         let mut retry_interval = params.base_repeat_interval;
         let mut last_send = Instant::now();
 
@@ -490,19 +489,8 @@ pub async fn resolve<S: AsRef<str>>(
 
             let mut buf = [0u8; 4096];
 
-            let recv = async {
-                let (len, addr) = socket.recv_from(&mut buf).await?;
-                Result::Ok(Some((len, addr)))
-            };
-
-            let timer = async {
-                let timer = smol::Timer::at(recv_deadline);
-                timer.await;
-                Result::Ok(None)
-            };
-
-            if let Some((len, addr)) = recv.or(timer).await? {
-                match Packet::parse(&buf[..len]) {
+            match tokio::time::timeout(recv_deadline - now, socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, addr))) => match Packet::parse(&buf[..len]) {
                     Ok(dns) => {
                         let response = Response::new(&dns);
                         if !valid_source_address(addr) {
@@ -522,45 +510,49 @@ pub async fn resolve<S: AsRef<str>>(
                     Err(e) => {
                         log::trace!("failed to parse packet: {e:?} received from {addr:?}");
                     }
+                },
+                Ok(Err(e)) => {
+                    log::trace!("io error: {e:?} received from {addr:?}");
+                    return Err(e.into());
                 }
-            } else {
-                log::trace!("resolve loop read timeout; send another query");
-                // retry_interval exceeded, so send another query
-                let data = make_query(&service_name, params.query_type)?;
-                socket.send_to(&data, addr).await?;
-                last_send = Instant::now();
+                Err(_) => {
+                    log::trace!("resolve loop read timeout; send another query");
+                    // retry_interval exceeded, so send another query
+                    let data = make_query(&service_name, params.query_type)?;
+                    socket.send_to(&data, addr).await?;
+                    last_send = Instant::now();
 
-                // And compute next interval
-                match retry_interval.take() {
-                    None => {
-                        // No retries; we're done!
-                        break;
+                    // And compute next interval
+                    match retry_interval.take() {
+                        None => {
+                            // No retries; we're done!
+                            break;
+                        }
+                        Some(retry) => {
+                            let base = params.base_repeat_interval.unwrap();
+
+                            let retry = if params.exponential_backoff {
+                                retry + retry
+                            } else {
+                                retry + base
+                            };
+
+                            let retry = params
+                                .max_repeat_interval
+                                .map(|max| retry.min(max))
+                                .unwrap_or(retry);
+
+                            retry_interval.replace(retry);
+                        }
                     }
-                    Some(retry) => {
-                        let base = params.base_repeat_interval.unwrap();
-
-                        let retry = if params.exponential_backoff {
-                            retry + retry
-                        } else {
-                            retry + base
-                        };
-
-                        let retry = params
-                            .max_repeat_interval
-                            .map(|max| retry.min(max))
-                            .unwrap_or(retry);
-
-                        retry_interval.replace(retry);
-                    }
+                    log::trace!("updated retry_interval is now {retry_interval:?}");
                 }
-                log::trace!("updated retry_interval is now {retry_interval:?}");
             }
         }
 
         log::trace!("resolve loop completing OK");
         Result::Ok(())
-    })
-    .detach();
+    });
 
     Ok(rx)
 }
